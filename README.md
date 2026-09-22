@@ -1,75 +1,200 @@
 # Mini E-Commerce Backend
 
-A production-style Mini E-Commerce Backend REST API built with Node.js, Express, PostgreSQL, JWT authentication, and Docker.
+A REST API for a small e-commerce system, built with Node.js, Express, and PostgreSQL, using JWT for authentication and Docker for deployment. There is **no frontend** — you interact with it purely through HTTP requests (curl, Postman, `Invoke-RestMethod`, etc.).
 
-This is an **API only** project — there is no website/frontend. You interact with it by sending HTTP requests (via `curl`, PowerShell's `Invoke-RestMethod`, Postman, etc.) to `http://localhost:3000`.
+## Overview
 
-## Tech Stack
+The API covers the core backend of an online store:
 
-- Node.js (LTS) + Express.js
-- PostgreSQL 16
-- JWT authentication
-- bcrypt password hashing
-- Docker + Docker Compose
+- **Auth** — register/login customers, issue JWTs
+- **Products** — public catalog browsing, admin-only create/update/delete
+- **Cart** — per-user cart, add/update/remove items
+- **Orders** — checkout a cart into an order (transactional, stock-safe), view order history
+- **Admin** — view all orders across all users
+
+Two roles exist: `customer` (default on registration) and `admin` (seeded manually). Role is embedded in the JWT and checked per-route.
+
+## Flow
+
+**Registration → Login → Browse → Cart → Checkout**
+
+1. `POST /api/auth/register` — email + password (min 8 chars) validated, password hashed with bcrypt, user stored with role `customer`.
+2. `POST /api/auth/login` — credentials checked against the stored hash; on success, a JWT (`{ id, email, role }`, 1-day expiry) is signed and returned.
+3. The client stores the JWT and sends it as `Authorization: Bearer <token>` on every protected request.
+4. `GET /api/products` — anyone (no token) can browse the catalog.
+5. `POST /api/cart` — an authenticated user adds a product + quantity to their cart; stock is checked before the item is added.
+6. `GET /api/cart` / `PUT /api/cart/:itemId` / `DELETE /api/cart/:itemId` — view or adjust the cart before checkout.
+7. `POST /api/orders` — checkout. This runs as a single database transaction:
+   1. Lock and read the user's cart items (`FOR UPDATE`)
+   2. Reject if the cart is empty
+   3. Validate stock for every item
+   4. Insert the `order` (status `PENDING`) and its `order_items`
+   5. Decrement product stock
+   6. Clear the cart
+   7. Commit — or roll back entirely if any step fails
+
+   This guarantees there are never partial orders or oversold stock, even under concurrent checkouts.
+8. `GET /api/orders` / `GET /api/orders/:id` — the user reviews their own order history.
+9. `GET /api/admin/orders` — an admin can see every order in the system.
+
+Every protected route passes through `authMiddleware` (verifies the JWT, attaches `req.user`) and, for admin-only routes, `adminMiddleware` (rejects anything but `role === 'admin'`).
 
 ## Architecture
 
-Everything runs as three Docker containers, wired together by `docker-compose.yml` — nothing needs to be installed on the host besides Docker itself:
+Three containers, wired by `docker-compose.yml`:
 
 | Container | Image | Purpose | Host port |
 |---|---|---|---|
-| `ecommerce-api` | built from `Dockerfile` | the Express REST API | `3000` |
-| `ecommerce-postgres` | `postgres:16` | the database, auto-seeded on first boot | `5432` |
+| `ecommerce-api` | built from `Dockerfile` | Express REST API | `3000` |
+| `ecommerce-postgres` | `postgres:16` | database, auto-seeded on first boot from `database/schema.sql` + `database/seed.sql` | `5432` |
 | `ecommerce-pgadmin` | `dpage/pgadmin4` | optional web GUI for browsing the database | `5050` |
 
-The containers talk to each other over Docker's internal network using their **container names** as hostnames (e.g. the API connects to the database at host `postgres`, not `localhost`). From your own machine, everything is reached via `localhost` and the ports above.
+Containers talk to each other over Docker's internal network by container name (the API connects to the DB at host `postgres`, not `localhost`). Database data lives in a named volume (`postgres_data`) so it survives restarts/rebuilds.
 
-Database data is stored in a named Docker volume (`postgres_data`), so it survives container restarts and rebuilds — it's only wiped if you explicitly remove that volume.
+**Request path:** `app.js` wires routes → `middleware` (auth/admin) → `controllers` (business logic + SQL via the `pg` pool in `config/db.js`) → `utils/response.js` for a consistent error shape.
 
-## Prerequisites
+```text
+ecommerce-backend/
+├── src/
+│   ├── config/db.js          # PostgreSQL connection pool
+│   ├── controllers/          # business logic per resource
+│   ├── middleware/           # JWT auth, admin role check
+│   ├── routes/                # route → controller wiring
+│   ├── utils/response.js     # shared error response helper
+│   └── app.js                 # express app, route mounting
+├── database/
+│   ├── schema.sql             # table definitions
+│   └── seed.sql                # admin account + sample products
+├── Dockerfile
+├── docker-compose.yml
+├── .env.example
+├── package.json
+└── server.js                   # entrypoint
+```
 
-You only need **Docker** — you do **not** need to install Node.js or PostgreSQL yourself, they run inside containers.
+**Data model** (`database/schema.sql`): `users` → `cart_items` → `products`; `orders` → `order_items` → `products`. Orders keep a frozen `price` per line item at time of purchase, independent of later product price changes.
 
-- **Docker Desktop** (includes Docker Compose v2) — [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
-  - **Windows**: requires the **WSL 2** backend.
-    - If Docker Desktop reports WSL2 isn't enabled, run in an **admin** PowerShell, then restart your PC:
-      ```powershell
-      wsl --install --no-distribution
-      ```
-    - If it reports the `LanmanServer` (Windows Server) service is disabled, also run (as admin):
-      ```powershell
-      Set-Service -Name LanmanServer -StartupType Automatic
-      Start-Service -Name LanmanServer
-      ```
-  - **macOS**: Docker Desktop works out of the box (Intel or Apple Silicon).
-  - **Linux**: install Docker Engine + the Compose plugin via your distro's package manager, or Docker Desktop for Linux.
-- Confirm it's working before continuing:
-  ```bash
-  docker --version
-  docker compose version
-  ```
-- Optional: `git` if you're cloning this repo onto another machine.
+## Tech Stack
 
-## Running On Another Device
+- **Runtime:** Node.js (LTS) + Express.js
+- **Database:** PostgreSQL 16 (via the `pg` driver, connection pooling)
+- **Auth:** JSON Web Tokens (`jsonwebtoken`)
+- **Password hashing:** `bcrypt`
+- **Other:** `cors`, `dotenv`
+- **Dev:** `nodemon`
+- **Infra:** Docker + Docker Compose, pgAdmin4 (optional DB GUI)
 
-1. Get the project onto the machine — either copy the `ecommerce-backend` folder over, or `git clone` it if it's in a repo.
-2. Make sure Docker Desktop is installed and running (see Prerequisites above), and its whale icon shows "Engine running".
-3. From inside the `ecommerce-backend` folder, create your `.env`:
+## Input & Output
+
+All responses are JSON. Errors follow a consistent shape:
+
+```json
+{ "success": false, "message": "Insufficient stock" }
+```
+
+Successful responses return the resource directly (no wrapper). Examples:
+
+| Endpoint | Input | Output |
+|---|---|---|
+| `POST /api/auth/register` | `{ "email": "you@example.com", "password": "Password123!" }` | `201` `{ "message": "User registered successfully" }` |
+| `POST /api/auth/login` | `{ "email": "...", "password": "..." }` | `200` `{ "token": "<JWT>" }` |
+| `GET /api/products` | — | `200` `[{ "id", "name", "description", "price", "stock" }, ...]` |
+| `POST /api/products` (admin) | `{ "name", "description", "price", "stock" }` | `201` `{ "id": 1 }` |
+| `POST /api/cart` (auth) | `{ "productId": 1, "quantity": 2 }` | `201` cart item row |
+| `GET /api/cart` (auth) | — | `200` `[{ "itemId", "productId", "name", "quantity", "price" }, ...]` |
+| `PUT /api/cart/:itemId` (auth) | `{ "quantity": 3 }` | `200` updated cart item |
+| `DELETE /api/cart/:itemId` (auth) | — | `200` `{ "message": "Item removed from cart" }` |
+| `POST /api/orders` (auth) | — (uses current cart) | `201` `{ "orderId": 5, "status": "PENDING" }` |
+| `GET /api/orders` (auth) | — | `200` `[{ "id", "total_amount", "status", "created_at" }, ...]` |
+| `GET /api/orders/:id` (auth) | — | `200` order + `items[]` |
+| `GET /api/admin/orders` (admin) | — | `200` `[{ "id", "userId", "email", "total_amount", "status", "created_at" }, ...]` |
+
+Authenticated requests must include:
+```
+Authorization: Bearer <JWT_TOKEN>
+```
+
+### Full endpoint reference
+
+**Auth**
+| Method | Endpoint | Description |
+|---|---|---|
+| POST | `/api/auth/register` | Register a new customer account |
+| POST | `/api/auth/login` | Login and receive a JWT |
+
+**Products**
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| GET | `/api/products` | Public | List products |
+| GET | `/api/products/:id` | Public | Get product details |
+| POST | `/api/products` | Admin | Create product |
+| PUT | `/api/products/:id` | Admin | Update product |
+| DELETE | `/api/products/:id` | Admin | Delete product |
+
+**Cart**
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/api/cart` | User | Add item to cart |
+| GET | `/api/cart` | User | View cart |
+| PUT | `/api/cart/:itemId` | User | Update cart item quantity |
+| DELETE | `/api/cart/:itemId` | User | Remove item from cart |
+
+**Orders**
+| Method | Endpoint | Auth | Description |
+|---|---|---|---|
+| POST | `/api/orders` | User | Place an order from cart (transactional) |
+| GET | `/api/orders` | User | List own order history |
+| GET | `/api/orders/:id` | User | Get order details |
+| GET | `/api/admin/orders` | Admin | List all orders |
+
+`GET /health` is a public, unauthenticated liveness check (`{ "status": "ok" }`).
+
+## How to Set Up This Project on Another Device
+
+You only need **Docker** on the new machine — Node.js and PostgreSQL both run inside containers.
+
+1. **Get the code onto the machine**
+   ```bash
+   git clone <this-repo-url>
+   cd ecommerce-backend
+   ```
+   (or copy the folder over directly)
+
+2. **Install Docker Desktop** (includes Docker Compose v2) — [docker.com/products/docker-desktop](https://www.docker.com/products/docker-desktop/)
+   - **Windows:** requires the WSL 2 backend. If Docker reports WSL2 isn't enabled, run in an admin PowerShell then restart:
+     ```powershell
+     wsl --install --no-distribution
+     ```
+   - **macOS:** works out of the box (Intel or Apple Silicon)
+   - **Linux:** install Docker Engine + the Compose plugin via your distro's package manager
+   - Verify:
+     ```bash
+     docker --version
+     docker compose version
+     ```
+
+3. **Create your `.env`**
    ```bash
    cp .env.example .env
    ```
-   The default values work as-is for local use. Only change `JWT_SECRET` and DB credentials if you're deploying somewhere shared/public.
-4. Build and start everything:
+   The defaults work as-is for local use. Only change `JWT_SECRET` and DB credentials before deploying somewhere shared/public.
+
+4. **Build and start everything**
    ```bash
    docker compose up -d --build
    ```
-5. Confirm it's healthy:
+   This starts the API, Postgres (auto-seeded from `database/schema.sql` + `seed.sql` on first boot), and pgAdmin.
+
+5. **Confirm it's healthy**
    ```bash
    docker compose ps
    curl http://localhost:3000/health
    ```
 
-That's it — no Node.js install, no PostgreSQL install, no manual dependency setup required on the new machine.
+### Seeded data
+
+- Admin login: `admin@example.com` / `Admin123!`
+- 5 sample products (Gaming Laptop, Mechanical Keyboard, Gaming Mouse, Monitor, Headset)
 
 ### Everyday commands
 
@@ -82,167 +207,25 @@ docker compose down -v         # stop everything AND delete the database volume
 docker compose restart api     # restart just one service
 ```
 
-### Seeded accounts / data
+### Running locally without Docker
 
-- Admin login: `admin@example.com` / `Admin123!`
-- 5 sample products (Gaming Laptop, Mechanical Keyboard, Gaming Mouse, Monitor, Headset)
-
-## Trying The API
-
-No frontend — you call the endpoints directly. Examples in PowerShell:
-
-```powershell
-# Register
-Invoke-RestMethod -Method Post http://localhost:3000/api/auth/register `
-  -ContentType "application/json" -Body '{"email":"you@example.com","password":"Password123!"}'
-
-# Login (returns a JWT)
-$login = Invoke-RestMethod -Method Post http://localhost:3000/api/auth/login `
-  -ContentType "application/json" -Body '{"email":"you@example.com","password":"Password123!"}'
-
-# List products (public, no token needed)
-Invoke-RestMethod http://localhost:3000/api/products
-
-# Add to cart (needs the token from login)
-$headers = @{ Authorization = "Bearer $($login.token)" }
-Invoke-RestMethod -Method Post http://localhost:3000/api/cart -Headers $headers `
-  -ContentType "application/json" -Body '{"productId":1,"quantity":2}'
-
-# Place an order
-Invoke-RestMethod -Method Post http://localhost:3000/api/orders -Headers $headers
-```
-
-Equivalent `curl` for macOS/Linux:
-```bash
-curl -X POST http://localhost:3000/api/auth/login \
-  -H "Content-Type: application/json" \
-  -d '{"email":"you@example.com","password":"Password123!"}'
-```
-
-## Viewing the Database Schema with a GUI (pgAdmin)
-
-1. Open **http://localhost:5050**.
-2. Log in with `admin@example.com` / `admin`.
-3. First time only — register the server: right-click **Servers → Register → Server...**
-   - **General** tab → Name: anything (e.g. `ecommerce`)
-   - **Connection** tab → Host: `postgres` (the container name, not `localhost`), Port: `5432`, Maintenance DB: `ecommerce`, Username: `admin`, Password: `password`
-4. Expand **Servers → ecommerce → Databases → ecommerce → Schemas → public → Tables** to see `users`, `products`, `cart_items`, `orders`, `order_items`.
-
-## Running Locally (without Docker)
-
-1. Install dependencies:
-   ```bash
-   npm install
-   ```
-2. Start a PostgreSQL 16 instance and update `.env` accordingly.
-3. Apply the schema and seed data:
+1. `npm install`
+2. Start a PostgreSQL 16 instance and point `.env` at it
+3. Apply schema + seed:
    ```bash
    psql -h localhost -U admin -d ecommerce -f database/schema.sql
    psql -h localhost -U admin -d ecommerce -f database/seed.sql
    ```
-4. Run the app:
-   ```bash
-   npm run dev
-   ```
+4. `npm run dev`
 
-## API Overview
+### Viewing the database with pgAdmin
 
-### Auth
-| Method | Endpoint | Description |
-|---|---|---|
-| POST | `/api/auth/register` | Register a new customer account |
-| POST | `/api/auth/login` | Login and receive a JWT |
+1. Open `http://localhost:5050`, log in with `admin@example.com` / `admin`.
+2. Register a server: Host `postgres` (the container name, not `localhost`), Port `5432`, Maintenance DB `ecommerce`, Username `admin`, Password `password`.
+3. Browse **Servers → ecommerce → Databases → ecommerce → Schemas → public → Tables**.
 
-### Products
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| GET | `/api/products` | Public | List products |
-| GET | `/api/products/:id` | Public | Get product details |
-| POST | `/api/products` | Admin | Create product |
-| PUT | `/api/products/:id` | Admin | Update product |
-| DELETE | `/api/products/:id` | Admin | Delete product |
+### Troubleshooting
 
-### Cart
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| POST | `/api/cart` | User | Add item to cart |
-| GET | `/api/cart` | User | View cart |
-| PUT | `/api/cart/:itemId` | User | Update cart item quantity |
-| DELETE | `/api/cart/:itemId` | User | Remove item from cart |
-
-### Orders
-| Method | Endpoint | Auth | Description |
-|---|---|---|---|
-| POST | `/api/orders` | User | Place an order from cart (transactional) |
-| GET | `/api/orders` | User | List own order history |
-| GET | `/api/orders/:id` | User | Get order details |
-| GET | `/api/admin/orders` | Admin | List all orders |
-
-All authenticated routes require:
-```
-Authorization: Bearer <JWT_TOKEN>
-```
-
-## Order Placement Transaction
-
-Placing an order runs inside a single PostgreSQL transaction:
-
-1. Read cart items (row-locked)
-2. Validate stock for every item
-3. Create the order
-4. Create order items
-5. Deduct product stock
-6. Clear the cart
-7. Commit — or roll back entirely if any step fails
-
-This guarantees no partial orders and no stock inconsistency.
-
-## Error Format
-
-```json
-{
-  "success": false,
-  "message": "Insufficient stock"
-}
-```
-
-## Troubleshooting
-
-**Docker Desktop won't start / "WSL 2" or "LanmanServer" error (Windows)**
-See the Prerequisites section above — this needs an admin PowerShell to enable WSL2 and the LanmanServer service, followed by a restart.
-
-**`docker` command not found in a new terminal**
-Open a fresh terminal after installing Docker Desktop so it picks up the updated PATH. If it still doesn't work, the CLI binary is at:
-```
-C:\Users\<you>\AppData\Local\Programs\DockerDesktop\resources\bin\docker.exe
-```
-
-**API container keeps restarting with `Error loading shared library ... bcrypt_lib.node: Exec format error`**
-This happens if the API container's `node_modules` gets overwritten by a bind mount to your host's `node_modules` (e.g. if you add `volumes: - .:/usr/src/app` back into `docker-compose.yml` for live-reload). Native modules like `bcrypt` are compiled per-OS, so a Windows/macOS-built copy can't run inside the Linux container. This project's `docker-compose.yml` intentionally does **not** bind-mount source code into the `api` container for this reason.
-
-**pgAdmin login fails with `'NoneType' object is not subscriptable`**
-This is a stale-session bug in pgAdmin, not a real auth failure. Fix: open pgAdmin in a private/incognito browser window, or clear cookies for `localhost:5050`, then log in again. Restarting the container also helps: `docker compose restart pgadmin`.
-
-**Port already in use (3000, 5432, or 5050)**
-Something else on your machine is using that port. Either stop it, or change the left-hand side of the port mapping in `docker-compose.yml` (e.g. `"3001:3000"`) and adjust the URL you use accordingly.
-
-## Project Structure
-
-```text
-ecommerce-backend/
-├── src/
-│   ├── config/db.js
-│   ├── controllers/
-│   ├── middleware/
-│   ├── routes/
-│   ├── utils/
-│   └── app.js
-├── database/
-│   ├── schema.sql
-│   └── seed.sql
-├── Dockerfile
-├── docker-compose.yml
-├── .env.example
-├── package.json
-└── server.js
-```
+- **Port already in use (3000/5432/5050):** something else on the machine holds that port — stop it, or remap the left side of the port mapping in `docker-compose.yml`.
+- **API container restart-loops with a `bcrypt` native module error:** don't bind-mount source into the `api` container — `bcrypt` is compiled per-OS, so a host-built copy can't run in the Linux container. This repo's `docker-compose.yml` intentionally avoids that mount.
+- **pgAdmin login fails with a `NoneType` error:** a stale-session bug in pgAdmin, not a real auth failure — retry in a private browser window or `docker compose restart pgadmin`.
